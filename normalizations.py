@@ -966,3 +966,222 @@ class no_norm(tf.keras.layers.Layer):
 
     def call(self, inputs):
         return inputs
+    
+#########################################################################
+
+# Flexible normalization. This uses a homogeneity heuristic function (Coen-Cagli, Kohn, Schwartz, 2016) 
+# to determine the mix ratio of center-only and center-surround normalization.
+
+class FNM(tf.keras.layers.Layer):
+
+    def get_config(self):
+        config = {
+            'surround_dist': self.surround_dist,
+            'beta_min': self._beta_min,
+            'beta_init': self._beta_init,
+            'gamma_init': self._gamma_init,
+            'a_init': self._a_init,
+            'b_init': self._b_init,
+            'data_format': self.data_format,
+        }
+        base_config = super(FNM, self).get_config()
+        return dict(list(base_config.items()) + list(config.items()))
+
+    def __init__(self,
+               surround_dist=4,
+               beta_min=1e-6,
+               beta_init = 1e-3,
+               gamma_init=1/8,
+               a_init=2,#4.8,
+               b_init=2,#10.5,
+               data_format='channels_last',
+               name=None,
+               trainable=True,
+               **kwargs):
+        super(FNM, self).__init__(
+            trainable=trainable,
+            name=name)#,
+            #**kwargs)
+
+        self.surround_dist = surround_dist
+        self._beta_min = beta_min
+        self._beta_init = beta_init
+        self._gamma_init = gamma_init
+        self._a_init = a_init
+        self._b_init = b_init
+        self.data_format = data_format
+        self._channel_axis()  # trigger ValueError early
+
+    def _channel_axis(self):
+        try:
+            return {'channels_first': 1, 'channels_last': -1}[self.data_format]
+        except KeyError:
+            raise ValueError('Unsupported `data_format` for FNM layer: {}.'.format(
+            self.data_format))
+    
+    def build(self, input_shape):
+        channel_axis = self._channel_axis()
+        self.norm_groups = int(input_shape[channel_axis]/8)
+        super(FNM, self).build(input_shape)
+        num_channels = input_shape[channel_axis]
+        if num_channels is None:
+            raise ValueError('The channel dimension of the inputs to `FNM` '
+                           'must be defined.')
+
+        if input_shape[channel_axis] % self.norm_groups != 0:
+            raise ValueError('The number of channels must be a multiple of '
+                           'the normalization_groups.')
+        
+        self._input_rank = input_shape.ndims
+
+        def beta_outside_initializer(shape, dtype=None, partition_info=None):
+            del partition_info  # unused
+            return tf.zeros(shape, dtype='float32')
+
+        def gamma_outside_initializer(shape, dtype=None, partition_info=None):
+            del partition_info  # unused
+            return tf.ones(shape, dtype='float32')
+
+        def beta_initializer(shape, dtype=None, partition_info=None):
+            del partition_info  # unused
+            return self._beta_init * tf.ones(shape, dtype='float32')
+
+        def gamma_k_initializer(shape, dtype=None, partition_info=None):
+            del partition_info  # unused
+            one_tensor = tf.ones(shape, dtype='float32')
+            return self._gamma_init * one_tensor
+
+        def gamma_s_initializer(shape, dtype=None, partition_info=None):
+            del partition_info  # unused
+            one_tensor = tf.ones(shape, dtype='float32')
+            return self._gamma_init * one_tensor
+
+        def a_initializer(shape, dtype=None, partition_info=None):
+            del partition_info  # unused
+            one_tensor = tf.ones(shape, dtype='float32')
+            return self._a_init * one_tensor
+          
+        def b_initializer(shape, dtype=None, partition_info=None):
+            del partition_info  # unused
+            one_tensor = tf.ones(shape, dtype='float32')
+            return self._b_init * one_tensor
+
+        gamma_k_shape = [1,] * 2  +  [num_channels//self.norm_groups, num_channels]
+        gamma_s_shape = [3,] * 2  +  [num_channels, 1]
+        beta_shape = [num_channels]
+        beta_outside_shape = [num_channels]
+        gamma_outside_shape = [num_channels]
+
+        self.beta = self.add_weight(
+            name='beta',
+            shape=beta_shape,
+            initializer=beta_initializer,
+            dtype=self.dtype,
+            constraint=keras.constraints.NonNeg(),
+            trainable=True)
+
+        self.gamma_k = self.add_weight(
+            name='gamma_k',
+            shape=gamma_k_shape,
+            initializer=gamma_k_initializer,
+            dtype=self.dtype,
+            constraint=keras.constraints.NonNeg(),
+            trainable=True)
+
+        self.gamma_s = self.add_weight(
+            name='gamma_s',
+            shape=gamma_s_shape,
+            initializer=gamma_s_initializer,
+            dtype=self.dtype,
+            constraint=keras.constraints.NonNeg(),
+            trainable=True)
+        
+        self.a = self.add_weight(
+            name='a',
+            initializer=a_initializer,
+            dtype=self.dtype,
+            constraint=keras.constraints.NonNeg(),
+            trainable=False)
+        
+        self.b = self.add_weight(
+            name='b',
+            initializer=b_initializer,
+            dtype=self.dtype,
+            constraint=keras.constraints.NonNeg(),
+            trainable=False)
+        
+        self.beta_outside = self.add_weight(
+            name='beta_outside',
+            shape=beta_outside_shape,
+            initializer=beta_outside_initializer,
+            dtype=self.dtype,
+            trainable=True)
+        
+        self.gamma_outside = self.add_weight(
+            name='gamma_outside',
+            shape=gamma_outside_shape,
+            initializer=gamma_outside_initializer,
+            dtype=self.dtype,
+            constraint=keras.constraints.NonNeg(),
+            trainable=True)
+
+        center_zero_tensor = tf.constant([[1.,1.,1.],[1.,0,1.],[1.,1.,1.]])  # center zero restriction. set to reparam_offset will lead to 0.
+        center_zero_tensor = tf.stack([center_zero_tensor] * num_channels, axis=2)  # build a [3, 3, #c] tensor
+        self.center_zero_tensor = tf.expand_dims(center_zero_tensor, axis = -1) # build a [3, 3, #c, 1] tensor
+
+        self.built = True
+
+    def call(self, inputs):
+        inputs = tf.convert_to_tensor(inputs, dtype=self.dtype)
+        ndim = self._input_rank
+        shape = self.gamma_k.get_shape().as_list()
+        dilation_rate = [self.surround_dist]*(ndim-2)
+        squared_inputs = tf.math.square(inputs)
+        squared_input_groups =  tf.split(squared_inputs, self.norm_groups, -1)
+        gamma_k_groups = tf.split(self.gamma_k, self.norm_groups, -1)
+
+        # Compute normalization pool.
+
+        # Pk for center group
+        convolve_k = lambda inputs_i, gamma_k: tf.nn.convolution(inputs_i,
+                                                                  gamma_k,
+                                                                  strides=(1, 1),
+                                                                  padding='SAME')
+            
+        Pk_groups= [convolve_k(i, k) for i,k in zip(squared_input_groups, gamma_k_groups)]
+        Pk = tf.concat(Pk_groups, axis=3)
+        
+        gamma_s = tf.math.multiply(self.gamma_s, self.center_zero_tensor)
+        paddings = tf.constant([[0,0],dilation_rate,dilation_rate,[0,0]])
+        Ps = tf.nn.depthwise_conv2d(tf.pad(squared_inputs, paddings, "REFLECT"),
+                                    gamma_s,
+                                    strides=[1,1,1,1],
+                                    padding='VALID',
+                                    dilations=dilation_rate)
+
+        S = tf.math.divide(tf.pow(tf.multiply(Pk, Ps),self.a), tf.add(tf.pow(tf.add(Pk, Ps),self.b), 1e-6)) 
+        # Calculate S=(Pk*Ps)^a/(Pk+Ps)^b  a=7, b=11.9 in the paper.
+        beta = self.beta + self._beta_min
+        norm_pool_k = tf.nn.bias_add(Pk, beta, data_format='N'+'DHW' [-(ndim - 2):]+'C') # NHWC
+        norm_pool_k = tf.math.sqrt(norm_pool_k)
+        norm_pool_ks = tf.nn.bias_add(tf.math.add(Pk, Ps), beta, data_format='N'+'DHW' [-(ndim - 2):]+'C') # NHWC
+        norm_pool_ks = tf.math.sqrt(norm_pool_ks)
+
+        reciprocal_Splus1 = tf.math.reciprocal(tf.add(S, 1))
+        norm_pool = tf.math.add(tf.math.multiply(reciprocal_Splus1,tf.math.reciprocal(norm_pool_k)), tf.math.multiply(tf.math.multiply(S, reciprocal_Splus1),tf.math.reciprocal(norm_pool_ks)))
+        # Calculate norm_pool = (1/(S+1)/norm_pool_k + S/(S+1)/norm_pool_ks)
+        outputs = tf.multiply(inputs, norm_pool)
+        outputs = outputs * self.gamma_outside + self.beta_outside
+        outputs.set_shape(inputs.get_shape())
+
+        return outputs
+
+    def compute_output_shape(self, input_shape):
+        channel_axis = self._channel_axis()
+        input_shape = tensor_shape.TensorShape(input_shape)
+        #if not 3 <= input_shape.ndim <= 5:
+        #  raise ValueError('`input_shape` must be of rank 3 to 5, inclusive.')
+        if input_shape[channel_axis].value is None:
+            raise ValueError(
+              'The channel dimension of `input_shape` must be defined.')
+        return input_shape
